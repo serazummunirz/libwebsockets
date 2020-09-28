@@ -63,7 +63,7 @@ if (ESP_PLATFORM)
 endif()
 
 # it's at this point any toolchain file is brought in
-project(libwebsockets C)
+project(libwebsockets C CXX)
 include(CTest)
 
 #
@@ -120,6 +120,7 @@ option(LWS_WITH_SYS_SMD "Lws System Message Distribution" ON)
 # Secure Streams
 #
 option(LWS_WITH_SECURE_STREAMS "Secure Streams protocol-agnostic API" OFF)
+option(LWS_WITH_SECURE_STREAMS_CPP "Secure Streams C++ classes" OFF)
 option(LWS_WITH_SECURE_STREAMS_PROXY_API "Secure Streams support to work across processes" OFF)
 option(LWS_WITH_SECURE_STREAMS_SYS_AUTH_API_AMAZON_COM "Auth support for api.amazon.com" OFF)
 option(LWS_WITH_SECURE_STREAMS_STATIC_POLICY_ONLY "Secure Streams Policy is hardcoded only" OFF)
