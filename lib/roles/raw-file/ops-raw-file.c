@@ -49,9 +49,11 @@ rops_handle_POLLIN_raw_file(struct lws_context_per_thread *pt, struct lws *wsi,
 		}
 	}
 
+#if 0
 	if (pollfd->revents & LWS_POLLHUP)
 		if (!(pollfd->revents & LWS_POLLIN))
 			return LWS_HPI_RET_PLEASE_CLOSE_ME;
+#endif
 
 	return LWS_HPI_RET_HANDLED;
 }
