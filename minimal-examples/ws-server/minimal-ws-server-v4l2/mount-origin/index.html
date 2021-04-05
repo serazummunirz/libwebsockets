@@ -9,6 +9,15 @@
 
 		LWS chat <b>minimal ws server VL42 example</b>. <br>V4L2 capture JPEG stills sent over ws as the browser can take them..
 		</td></tr></table>
-		<div><img id="img"></div>
+		<div>
+		        <!-- muted attribute required for chrome autoplay-->
+        <video id="stream_live" 
+            width="640" height="360" 
+            controls="false" autoplay="true"
+            muted="muted" 
+            preload="auto">
+            Your browser does not support the video tag.
+        </video> 
+		</div>
 	</body>
 </html>

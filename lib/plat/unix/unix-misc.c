@@ -48,13 +48,13 @@ lws_now_usecs(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &ts))
 		return 0;
 
-	return (((lws_usec_t)ts.tv_sec) * LWS_US_PER_SEC) +
-			((lws_usec_t)ts.tv_nsec / LWS_NS_PER_US);
+	return (lws_usec_t)(((lws_usec_t)ts.tv_sec) * (lws_usec_t)LWS_US_PER_SEC) +
+			((lws_usec_t)ts.tv_nsec / (lws_usec_t)LWS_NS_PER_US);
 #else
 	struct timeval now;
 
 	gettimeofday(&now, NULL);
-	return (((lws_usec_t)now.tv_sec) * LWS_US_PER_SEC) +
+	return (((lws_usec_t)now.tv_sec) * (lws_usec_t)LWS_US_PER_SEC) +
 			(lws_usec_t)now.tv_usec;
 #endif
 }

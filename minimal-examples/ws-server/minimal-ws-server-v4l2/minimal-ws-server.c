@@ -26,198 +26,93 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 
-#include <linux/videodev2.h>
-
 static const char *vdev = "/dev/video0";
 
-/* one of these created for each message */
+#include "private.h"
 
-struct msg {
-	void *payload; /* is malloc'd */
-	size_t len;
-};
+// uncomment this to copy the stream to a file "/tmp/str.mp4"
+#define DUMP_TO_FILE
 
-/* one of these is created for each client connecting to us */
-
-struct pss {
-	lws_dll2_t		list;
-
-	uint8_t			last[500 * 1024];
-
-	struct lws		*wsi;
-	int			last_sent; /* the last message number we sent */
-	int			fready;
-	size_t			last_len;
-	size_t			inside;
-};
-
-struct raw_vhd {
-
-	struct lws_context	*context;
-	struct lws_vhost	*vhost;
-	const struct lws_protocols *protocol;
-
-	lws_dll2_owner_t	owner;	/* pss list */
-
-	struct msg amsg; /* the one pending message... */
-	int current; /* the current message number we are caching */
-
-	struct lws		*capture_wsi;
-
-	int			filefd;
-	struct msg		*buffers;
-	unsigned int		bcount;
-	int			out_buf;
-
-	int			frame;
-};
-
-static int
-xioctl(int fh, unsigned long request, void *arg)
+static void
+pss_to(struct lws_sorted_usec_list *sul)
 {
-	int r;
+	struct pss *pss = lws_container_of(sul, struct pss, sul);
 
-	do {
-		r = ioctl(fh, request, arg);
-	} while (-1 == r && EINTR == errno);
+	lwsl_warn("%s: timedout\n", __func__);
 
-	return r;
+	lws_wsi_close(pss->wsi, LWS_TO_KILL_ASYNC);
 }
 
+
 static int
-init_device(int fd)
+__mirror_update_worst_tail(struct src_inst *si)
 {
-	struct v4l2_cropcap cropcap;
-	struct v4l2_queryctrl ctrl;
-	struct v4l2_capability cap;
-	struct v4l2_format fmt;
-	struct v4l2_crop crop;
-	struct v4l2_input inp;
-	int n = 0;
+	uint32_t wai, worst = 0, worst_tail = 0, oldest;
+	struct pss *worst_pss = NULL;
+	struct raw_vhd *vhd = lws_container_of(si->list.owner,
+					       struct raw_vhd, owner);
 
-	if (xioctl(fd, VIDIOC_S_INPUT, &n) == -1)
+	oldest = lws_ring_get_oldest_tail(si->ring);
+
+	lws_start_foreach_dll(struct lws_dll2 *, d, si->owner.head) {
+		struct pss *ps = lws_container_of(d, struct pss, list);
+
+		wai = (uint32_t)lws_ring_get_count_waiting_elements(si->ring,
+								    &ps->tail);
+		if (wai >= worst) {
+			worst = wai;
+			worst_tail = ps->tail;
+			worst_pss = ps;
+		}
+	} lws_end_foreach_dll(d);
+
+	if (!worst_pss)
+		return 0;
+
+	lws_ring_update_oldest_tail(si->ring, worst_tail);
+	if (oldest == lws_ring_get_oldest_tail(si->ring))
+		return 0;
+
+	/* if nothing in queue, no timeout needed */
+	if (!worst)
 		return 1;
 
-	if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
-		lwsl_err("%s: QUERYCAP failed\n", __func__);
+	/*
+	 * The guy(s) with the oldest tail block the ringbuffer from recycling
+	 * the FIFO entries he has not read yet.  Don't allow those guys to
+	 * block the FIFO operation for very long.
+	 */
+	lws_start_foreach_dll(struct lws_dll2 *, d, si->owner.head) {
+		struct pss *ps = lws_container_of(d, struct pss, list);
 
-		return 1;
-	}
+		if (ps->tail == worst_tail)
+			/*
+			 * Our policy is if you are the slowest connection,
+			 * you had better take something to help with that
+			 * within 3s, or we will hang up on you to stop you
+			 * blocking the FIFO for everyone else.
+			 */
+			lws_sul_schedule(vhd->context, 0, &ps->sul,
+					 pss_to, 3 * LWS_US_PER_SEC);
+	} lws_end_foreach_dll(d);
 
-	lwsl_notice("cap 0x%x, bus_info %s, driver %s, card %s\n",
-		(int)cap.capabilities, cap.bus_info, cap.driver, cap.card);
+	return 1;
+}
 
-	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-		lwsl_err("%s: Device not capable of capture\n", __func__);
+void
+__mirror_destroy_message(void *_msg)
+{
+	struct msg *pmsg = _msg;
 
-		return 1;
-	}
+	free(pmsg->payload);
+	pmsg->payload = NULL;
+	pmsg->len = 0;
+}
 
-	if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-		lwsl_err("%s: Device not capable of streaming\n", __func__);
-
-		return 1;
-	}
-
-	/* Select video input, video standard and tune here. */
-
-	memset(&inp, 0, sizeof(inp));
-	if (xioctl(fd, VIDIOC_ENUMINPUT, &inp) != -1)
-		lwsl_notice("%d %s %d\n", inp.index, inp.name, inp.type);
-
-	memset(&cropcap, 0, sizeof(cropcap));
-	cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-	if (!xioctl(fd, VIDIOC_CROPCAP, &cropcap)) {
-		crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		crop.c = cropcap.defrect; /* reset to default */
-
-		xioctl(fd, VIDIOC_S_CROP, &crop);
-	}
-
-	memset(&fmt, 0, sizeof(fmt));
-
-	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	fmt.fmt.pix.width       = 1280;
-	fmt.fmt.pix.height      = 720;
-	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG; // V4L2_PIX_FMT_H264;
-	fmt.fmt.pix.field       = V4L2_FIELD_ANY;
-
-	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-		lwsl_err("%s: Can't set FMT\n", __func__);
-
-		return 1;
-	}
-
-	/* Preserve original settings as set by v4l2-ctl for example */
-	//               if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
-	//                     errno_exit("VIDIOC_G_FMT");
-
-	lwsl_notice("%d %d %d %d %d\n", fmt.type, fmt.fmt.pix.width,
-		fmt.fmt.pix.height, fmt.fmt.pix.field, fmt.fmt.pix.sizeimage);
-#if 0
-	/* Buggy driver paranoia. */
-	min = fmt.fmt.pix.width * 2;
-	if (fmt.fmt.pix.bytesperline < min)
-		fmt.fmt.pix.bytesperline = min;
-	min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
-	if (fmt.fmt.pix.sizeimage < min)
-		fmt.fmt.pix.sizeimage = min;
+#if defined(DUMP_TO_FILE)
+int qfd = -1;
 #endif
 
-	/* Try the extended control API first */
-
-	ctrl.id = V4L2_CTRL_FLAG_NEXT_CTRL;
-	if (!xioctl (fd, VIDIOC_QUERYCTRL, &ctrl)) {
-		do {
-			fprintf(stderr, "%s\n", ctrl.name);
-			//		mw->add_control(ctrl, fd, grid, gridLayout);
-			ctrl.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
-		} while (!xioctl (fd, VIDIOC_QUERYCTRL, &ctrl));
-	}
-
-	return 0;
-}
-
-static int
-stop_capturing(struct raw_vhd *vhd)
-{
-	enum v4l2_buf_type type;
-
-	lws_rx_flow_control(vhd->capture_wsi, 0);
-
-	lwsl_notice("%s\n", __func__);
-	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-	return xioctl(vhd->filefd, VIDIOC_STREAMOFF, &type) == -1;
-}
-
-static int
-start_capturing(struct raw_vhd *vhd)
-{
-	unsigned int i;
-	enum v4l2_buf_type type;
-
-	for (i = 0; i < vhd->bcount; ++i) {
-		struct v4l2_buffer buf;
-
-		memset(&buf, 0, sizeof(buf));
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_MMAP;
-		buf.index = i;
-
-		if (xioctl(vhd->filefd, VIDIOC_QBUF, &buf) < 0) {
-			lwsl_warn("%s: unable to start cap\n", __func__);
-			return -1;
-		}
-	}
-	lwsl_notice("%s: stream on\n", __func__);
-
-	lws_rx_flow_control(vhd->capture_wsi, 1);
-
-	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	return xioctl(vhd->filefd, VIDIOC_STREAMON, &type) == -1;
-}
 
 /* v4l2 frame capture */
 
@@ -228,12 +123,14 @@ callback_v4l2(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 	struct raw_vhd *vhd = (struct raw_vhd *)lws_protocol_vh_priv_get(
 			lws_get_vhost(wsi), lws_get_protocol(wsi));
 	struct pss *pss = (struct pss *)user;
-	struct v4l2_requestbuffers req;
+	struct src_inst *si = NULL;
 	lws_sock_file_fd_type u;
 	struct v4l2_buffer buf;
-	//uint8_t buf[1024];
+	struct msg msg, *pmsg;
+	char name[300], t[1400 + LWS_PRE];
+	const char *pn;
 	size_t chunk;
-	int n;
+	int n, fd;
 
 	switch (reason) {
 	case LWS_CALLBACK_PROTOCOL_INIT:
@@ -244,13 +141,15 @@ callback_v4l2(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		vhd->protocol = lws_get_protocol(wsi);
 		vhd->vhost = lws_get_vhost(wsi);
 
-		vhd->filefd =  open(vdev, O_RDWR | O_NONBLOCK, 0);
-		if (vhd->filefd == -1) {
+		lws_pthread_mutex_init(&vhd->lock);
+
+		fd = open(vdev, O_RDWR | O_NONBLOCK, 0);
+		if (fd == -1) {
 			lwsl_err("Unable to open v4l2 device %s\n", vdev);
 
 			return 1;
 		}
-		u.filefd = (lws_filefd_type)(long long)vhd->filefd;
+		u.filefd = (lws_filefd_type)(long long)fd;
 		if (!lws_adopt_descriptor_vhost(lws_get_vhost(wsi),
 				LWS_ADOPT_RAW_FILE_DESC, u,
 				"lws-v4l2", NULL)) {
@@ -264,16 +163,9 @@ callback_v4l2(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 		return 0;
 
 bail:
-		close(vhd->filefd);
-		vhd->filefd = -1;
+		close(fd);
 
 		return -1;
-
-	case LWS_CALLBACK_PROTOCOL_DESTROY:
-
-		if (vhd && vhd->filefd != -1)
-			close(vhd->filefd);
-		break;
 
 		/*
 		 * callbacks related to capture file (no pss)
@@ -282,76 +174,13 @@ bail:
 	case LWS_CALLBACK_RAW_ADOPT_FILE:
 		lwsl_notice("LWS_CALLBACK_RAW_ADOPT_FILE\n");
 
-		if (init_device(vhd->filefd)) {
-			lwsl_err("%s: device init failed\n", __func__);
-
-			return 1;
-		}
-
-		vhd->capture_wsi = wsi;
-
-		memset(&req, 0, sizeof(req));
-
-		req.count = 4;
-		req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		req.memory = V4L2_MEMORY_MMAP;
-
-		if (xioctl(vhd->filefd, VIDIOC_REQBUFS, &req) < 0) {
-			lwsl_err("%s: mmap req bufs failed\n", __func__);
-			return 1;
-		}
-
-		if (req.count < 2) {
-			lwsl_err("%s: Insufficient buffer memory\n", __func__);
-			return 1;
-		}
-
-		vhd->buffers = calloc(req.count, sizeof(*vhd->buffers));
-
-		if (!vhd->buffers) {
-			lwsl_err("%s: OOM\n", __func__);
-			return 1;
-		}
-
-		for (vhd->bcount = 0; vhd->bcount < req.count; vhd->bcount++) {
-			struct v4l2_buffer buf;
-
-			memset(&buf, 0, sizeof(buf));
-
-			buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-			buf.memory      = V4L2_MEMORY_MMAP;
-			buf.index       = vhd->bcount;
-
-			if (xioctl(vhd->filefd, VIDIOC_QUERYBUF, &buf) < 0) {
-				lwsl_err("%s: querybuf failed\n", __func__);
-
-				goto bail1;
-			}
-
-			vhd->buffers[vhd->bcount].len = buf.length;
-			vhd->buffers[vhd->bcount].payload = (void *)
-			      mmap(NULL /* start anywhere */,
-					buf.length,
-					PROT_READ | PROT_WRITE /* required */,
-					MAP_SHARED /* recommended */,
-					vhd->filefd, buf.m.offset);
-
-			if (vhd->buffers[vhd->bcount].payload == MAP_FAILED) {
-				lwsl_err("%s: map failed\n", __func__);
-				goto bail1;
-			}
-		}
+		if (create_si(vhd, wsi))
+			return -1;
 
 		lws_rx_flow_control(wsi, 0);
 
 		lwsl_notice("%s: adopt completed ok\n", __func__);
 		break;
-
-bail1:
-		free(vhd->buffers);
-		vhd->buffers = NULL;
-
-		return 1;
 
 	case LWS_CALLBACK_RAW_CLOSE_FILE:
 		lwsl_notice("LWS_CALLBACK_RAW_CLOSE_FILE\n");
@@ -359,61 +188,83 @@ bail1:
 		if (!vhd)
 			break;
 
-		for (n = 0; n < (int)vhd->bcount; n++)
-			munmap(vhd->buffers[n].payload, vhd->buffers[n].len);
+		lws_pthread_mutex_lock(&vhd->lock); /* vhost lock { */
+		si = (struct src_inst *)lws_get_opaque_user_data(wsi);
 
-		free(vhd->buffers);
+		deinit_device(si);
+
+		lws_pthread_mutex_unlock(&vhd->lock); /* } vhost lock */
+
 		break;
 
 	case LWS_CALLBACK_RAW_RX_FILE:
 
-		memset(&buf, 0, sizeof(buf));
+		if (!vhd)
+			break;
 
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_MMAP;
+		si = (struct src_inst *)lws_get_opaque_user_data(wsi);
 
-		if (xioctl(vhd->filefd, VIDIOC_DQBUF, &buf) < 0) {
-			if (errno == EAGAIN)
+		if (lws_v4l2_dq(si, &buf))
+			return -1;
+
+		if (si->avcpc_d) {
+			/*
+			 * Transcoding needed
+			 *
+			 * decode MJPEG frame to bitmap
+			 */
+
+			n = av_parser_parse2(si->avcpc_d, si->avcc_d,
+					     &si->avp_d->data,
+					     &si->avp_d->size,
+					     si->buffers[buf.index].payload,
+					     buf.bytesused, AV_NOPTS_VALUE,
+					     AV_NOPTS_VALUE, 0);
+			if (n < 0) {
+				lwsl_warn("%s: Parsing failed\n", __func__);
+
 				return 0;
-			lwsl_warn("%s: DQBUF ioctl fail: %d\n",
-					__func__, errno);
+			}
+
+			if (si->avp_d->size)
+				/* encode the decoded bitmap into the
+				 * output stream */
+				transcode(si);
+
+		} else {
+			msg.payload = malloc(LWS_PRE + buf.bytesused);
+			msg.len = buf.bytesused;
+
+			if (!msg.payload)
+				lwsl_warn("%s: OOM underrun\n", __func__);
+			else {
+
+				memcpy(msg.payload + LWS_PRE,
+				       si->buffers[buf.index].payload,
+				       msg.len);
+
+				if (!lws_ring_insert(si->ring, &msg, 1)) {
+					__mirror_destroy_message(&msg);
+					lwsl_notice("dropping!\n");
+				}
+			}
+
+			si->frame++;
 		}
 
-		assert(buf.index < vhd->bcount);
+		lws_pthread_mutex_lock(&si->lock); /* si lock { */
 
-		vhd->frame++;
-
-		lws_start_foreach_dll(struct lws_dll2 *, d, vhd->owner.head) {
+		lws_start_foreach_dll(struct lws_dll2 *, d, si->owner.head) {
 			struct pss *ps = lws_container_of(d, struct pss, list);
-
-			if (!ps->inside) {
-				ps->last_len = buf.bytesused;
-				if (ps->last_len > sizeof(ps->last) - LWS_PRE)
-					ps->last_len = sizeof(ps->last) - LWS_PRE;
-
-				memcpy(ps->last + LWS_PRE,
-				       vhd->buffers[buf.index].payload,
-				       ps->last_len);
-
-				ps->fready = vhd->frame;
-			}
 
 			lws_callback_on_writable(ps->wsi);
 		} lws_end_foreach_dll(d);
 
-		if (xioctl(vhd->filefd, VIDIOC_QBUF, &buf) < 0) {
-			lwsl_err("%s: QBUF failed\n", __func__);
+		lws_pthread_mutex_unlock(&si->lock); /* } si lock */
+
+		if (lws_v4l2_q(si, &buf))
 			return -1;
-		}
 
-		break;
-
-	case LWS_CALLBACK_RAW_WRITEABLE_FILE:
-		lwsl_notice("LWS_CALLBACK_RAW_WRITEABLE_FILE\n");
-		/*
-		 * you can call lws_callback_on_writable() on a raw file wsi as
-		 * usual, and then write directly into the raw filefd here.
-		 */
 		break;
 
 	/*
@@ -421,58 +272,224 @@ bail1:
 	 */
 
 	case LWS_CALLBACK_ESTABLISHED:
+
+		if (!vhd->owner.head)
+			return 0;
+
 		pss->wsi = wsi;
 
-		/* add ourselves to the list of live pss held in the vhd */
-		lws_dll2_add_tail(&pss->list, &vhd->owner);
+#if defined(DUMP_TO_FILE)
+		if (qfd != -1)
+			close(qfd);
+		qfd = open("/tmp/str.mp4", O_CREAT|O_TRUNC|O_WRONLY, 0600);
+#endif
+
+		name[0] = '\0';
+		pn = "0";
+		if (!lws_get_urlarg_by_name(wsi, "src", name, sizeof(name) - 1))
+			lwsl_debug("get urlarg failed\n");
+
+		/* is there a source instance of this name already extant? */
+
+		lws_pthread_mutex_lock(&vhd->lock); /* vhost lock { */
+
+		si = NULL;
+		lws_start_foreach_dll(struct lws_dll2 *, d, vhd->owner.head) {
+			struct src_inst *mi1 = lws_container_of(d,
+						struct src_inst, list);
+
+			if (!strcmp(pn, mi1->name)) {
+				/* yes... we will join it */
+				si = mi1;
+				break;
+			}
+		} lws_end_foreach_dll(d);
+
+		/* no existing source instance for name, join first si */
+		if (!si)
+			si = lws_container_of(vhd->owner.head,
+					      struct src_inst,
+					      owner);
+
+		/* add ourselves to the list of live pss held in the si */
+		lws_dll2_add_tail(&pss->list, &si->owner);
+
+		pss->tail = lws_ring_get_oldest_tail(si->ring);
+
+		lws_pthread_mutex_unlock(&vhd->lock); /* } vh lock */
 		lws_callback_on_writable(wsi);
 
-		if (vhd->owner.count == 1)
-			start_capturing(vhd);
+		if (si->owner.count == 1)
+			start_capturing(si);
 		break;
 
 	case LWS_CALLBACK_CLOSED:
+
+		if (!pss->list.owner)
+			break;
+
+		lws_sul_cancel(&pss->sul);
+
+		si = lws_container_of(pss->list.owner,
+				      struct src_inst, owner);
+
 		/* remove our closing pss from the list of live pss */
 		lws_dll2_remove(&pss->list);
 
-		if (vhd->owner.count == 0)
-			stop_capturing(vhd);
+		if (si->owner.count == 0)
+			stop_capturing(si);
+
+#if defined(DUMP_TO_FILE)
+		if (qfd != -1)
+			close(qfd);
+#endif
 		break;
 
 	case LWS_CALLBACK_SERVER_WRITEABLE:
 
-		if (!pss->inside && pss->last_sent == pss->fready)
+		if (!pss->list.owner)
 			break;
 
-		if (!pss->inside)
-			pss->last_sent = pss->fready;
+		si = lws_container_of(pss->list.owner, struct src_inst, owner);
 
-		/*
-		 * To work with ws-over-h2, we must restrict the size of
-		 * the encapsulated frames we are sending.  It's a good idea
-		 * to handle h1 ws the same way in user code.
-		 */
+		if (!pss->inserted_mp4) {
+			if (!si->mp4_header_len || !si->subsequent)
+				return 0;
 
-		chunk = pss->last_len - pss->inside;
-		if (chunk > 1400)
-			chunk = 1400;
+#if defined(DUMP_TO_FILE)
+			write(qfd, si->mp4_hdr + LWS_PRE, si->mp4_header_len);
+#endif
 
-		/* notice we allowed for LWS_PRE in the payload already */
-		n = lws_write(wsi, pss->last + LWS_PRE + pss->inside,
-			      chunk, lws_write_ws_flags(LWS_WRITE_BINARY,
-			      !pss->inside, pss->inside + chunk == pss->last_len));
-		if (n < (int)chunk) {
-			lwsl_err("ERROR %d writing to ws\n", n);
-			return -1;
-		}
+			lwsl_err("%s: writing %d\n", __func__, (int)si->mp4_header_len);
+			lwsl_hexdump_notice(si->mp4_hdr + LWS_PRE, si->mp4_header_len);
+			n = lws_write(wsi, si->mp4_hdr + LWS_PRE,
+				      si->mp4_header_len, LWS_WRITE_BINARY);
+			if (n < (int)si->mp4_header_len) {
+				lwsl_err("ERROR %d writing to ws\n", n);
 
-		pss->inside += chunk;
-		if (pss->inside == pss->last_len)
-			/* ready for new one */
-			pss->inside = 0;
-		else
+				return -1;
+			}
+			pss->inserted_mp4 = 1;
 			lws_callback_on_writable(wsi);
 
+			return 0;
+		}
+
+		lws_pthread_mutex_lock(&si->lock); /* instance lock { */
+		do {
+			char first = 0, doing_moof = 0;
+			uint8_t *place;
+
+			pmsg = (struct msg *)lws_ring_get_element(si->ring, &pss->tail);
+			if (!pmsg)
+				continue;
+
+			/*
+			 * Chrome insists to see moof->traf->tfdt boxes,
+			 * these seem to be needed to be added later
+			 * so they are relative to the time the peer
+			 * joined the stream
+			 */
+
+			/*
+			 * To work with ws-over-h2, we must restrict the size of
+			 * the encapsulated frames we are sending.  It's a good
+			 * idea to handle h1 ws the same way in user code.
+			 */
+#ifdef OWN_MOOF
+			if (!pss->did_moof) {
+				int xlen = !si->annex_b_len || pss->sent_initial_moof ? 5 : si->annex_b_len;
+
+				place = (uint8_t *)t + LWS_PRE;
+				chunk = moof_prepare(si, place, pss,
+						     sizeof(t) - LWS_PRE,
+						     pmsg->len + xlen,
+						     0x51615);
+				first = 1;
+				pss->did_moof = 1;
+				doing_moof = 1;
+#if 1
+				if (si->annex_b_len && !pss->sent_initial_moof) {
+					/*
+					 * Let's give the whole set of
+					 * NALs the first time we join the
+					 * stream
+					 */
+
+					lwsl_hexdump_err(si->annex_b, si->annex_b_len);
+
+					memcpy(place + chunk, si->annex_b, si->annex_b_len);
+					chunk += si->annex_b_len;
+				} else {
+					/*
+					 * For the rest of the fragments, we
+					 * just need the IDR NAL
+					 */
+					place[chunk++] = 0x00;
+					place[chunk++] = 0x00;
+					place[chunk++] = 0x00;
+					place[chunk++] = 0x01;
+					place[chunk++] = 0x65;
+				}
+#endif
+				pss->sent_initial_moof = 1;
+
+//				lwsl_notice("%s: doing moof\n", __func__);
+//				lwsl_hexdump_notice(place, chunk);
+
+			} else
+#endif
+			{
+				chunk = pmsg->len - pss->inside;
+				place = pmsg->payload + LWS_PRE + pss->inside;
+#ifdef OWN_MOOF
+				first = 0;
+#else
+				first = !pss->inside;
+#endif
+			}
+
+			if (chunk > 1400)
+				chunk = 1400;
+
+			if (place != (uint8_t *)t + LWS_PRE)
+				memcpy(t + LWS_PRE, place, chunk);
+
+			n = lws_write_ws_flags(LWS_WRITE_BINARY, first,
+					       !doing_moof &&
+					       pss->inside + chunk == pmsg->len);
+#if defined(DUMP_TO_FILE)
+			write(qfd, t + LWS_PRE, chunk);
+#endif
+
+			n = lws_write(wsi, (uint8_t *)(t + LWS_PRE), chunk, n);
+			if (n < (int)chunk) {
+				lwsl_err("ERROR %d writing to ws\n", n);
+				lws_pthread_mutex_unlock(&si->lock); /* } instance lock */
+
+				return -1;
+			}
+
+			if (!doing_moof)
+				pss->inside += chunk;
+
+			if (pss->inside == pmsg->len) {
+				/* ready for new one */
+				pss->inside = 0;
+				pss->did_moof = 0;
+//				lwsl_notice("%s: sent %d\n", __func__, (int)pmsg->len);
+				lws_ring_consume(si->ring, &pss->tail, NULL, 1);
+				__mirror_update_worst_tail(si);
+				lws_sul_cancel(&pss->sul);
+			}
+
+		} while (pmsg && !lws_send_pipe_choked(wsi));
+
+		if (pss->inside ||
+		    lws_ring_get_count_waiting_elements(si->ring, &pss->tail))
+			lws_callback_on_writable(wsi);
+
+		lws_pthread_mutex_unlock(&si->lock); /* } instance lock */
 		break;
 
 	case LWS_CALLBACK_RECEIVE:
@@ -487,7 +504,7 @@ bail1:
 
 static struct lws_protocols protocols[] = {
 	{ "http", lws_callback_http_dummy, 0, 0 },
-	{ "lws-v4l2", callback_v4l2,  sizeof(struct pss), 1300, 1300, NULL, 0 },
+	{ "lws-v4l2", callback_v4l2,  sizeof(struct pss), 1800, 1800, NULL, 0 },
 	{ NULL, NULL, 0, 0 } /* terminator */
 };
 
@@ -546,13 +563,7 @@ int main(int argc, const char **argv)
 	struct lws_context_creation_info info;
 	struct lws_context *context;
 	const char *p;
-	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-			/* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-			/* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-			/* | LLL_EXT */ /* | LLL_CLIENT */ /* | LLL_LATENCY */
-			/* | LLL_DEBUG */;
+	int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE;
 
 	signal(SIGINT, sigint_handler);
 
@@ -566,12 +577,12 @@ int main(int argc, const char **argv)
 	lwsl_user("LWS minimal ws server V4L2 | visit http://localhost:7681\n");
 
 	memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-	info.port = 7681;
-	info.mounts = &mount;
-	info.protocols = protocols;
-	info.vhost_name = "localhost";
-	info.options = 0;
-	info.headers = pvo_hsbph;
+	info.port		= 7681;
+	info.mounts		= &mount;
+	info.protocols		= protocols;
+	info.vhost_name		= "localhost";
+	info.options		= 0;
+	info.headers		= pvo_hsbph;
 
 #if defined(LWS_WITH_TLS)
 	if (lws_cmdline_option(argc, argv, "-s")) {
