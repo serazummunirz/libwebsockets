@@ -134,7 +134,7 @@ int
 lws_display_alloc_diffusion(const lws_surface_info_t *ic, lws_surface_error_t **se)
 {
 	size_t size, gsize = ic->greyscale ? sizeof(lws_greyscale_error_t) :
-					     sizeof(lws_colour_error_t);
+					     sizeof(lws_colour_error_t), by;
 
 	if (*se)
 		return 0;
@@ -142,7 +142,8 @@ lws_display_alloc_diffusion(const lws_surface_info_t *ic, lws_surface_error_t **
 	/* defer creation of dlo's 2px-high dlo-width, 2 bytespp or 6 bytespp
 	 * error diffusion buffer */
 
-	size = gsize * 2u * (unsigned int)(ic->wh_px[0].whole);
+	by = ((ic->wh_px[0].whole + 7) / 8) * 8;
+	size = gsize * 2u * (unsigned int)by;
 
 	lwsl_info("%s: alloc'd %u for width %d\n", __func__, (unsigned int)size,
 			(int)ic->wh_px[0].whole);
@@ -181,7 +182,7 @@ void
 dist_err_floyd_steinberg_grey(int n, int width, lws_greyscale_error_t *gedl_this,
 			      lws_greyscale_error_t *gedl_next)
 {
-	if (n != width - 1) {
+	if (n < width - 1) {
 	        dist_err_grey(&gedl_this[n], &gedl_this[n + 1], 7);
 	        dist_err_grey(&gedl_this[n], &gedl_next[n + 1], 1);
 	}
@@ -197,7 +198,7 @@ void
 dist_err_floyd_steinberg_col(int n, int width, lws_colour_error_t *edl_this,
 			     lws_colour_error_t *edl_next)
 {
-	if (n != width - 1) {
+	if (n < width - 1) {
 	        dist_err_col(&edl_this[n], &edl_this[n + 1], 7);
 	        dist_err_col(&edl_this[n], &edl_next[n + 1], 1);
 	}
