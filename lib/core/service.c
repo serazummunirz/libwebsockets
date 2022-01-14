@@ -950,11 +950,13 @@ LWS_VISIBLE int
 lws_service_fd_tsi(struct lws_context *context, struct lws_pollfd *pollfd,
 		   int tsi)
 {
-	struct lws_context_per_thread *pt = &context->pt[tsi];
+	struct lws_context_per_thread *pt;
 	struct lws *wsi;
 
 	if (!context || context->being_destroyed1)
 		return -1;
+
+	pt = &context->pt[tsi];
 
 	/* the case there's no pollfd to service, we just want to do periodic */
 	if (!pollfd) {
