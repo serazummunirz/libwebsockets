@@ -88,7 +88,7 @@ lws_client_socket_service(struct lws *wsi, struct lws_pollfd *pollfd,
 	const char *cce = NULL;
 #if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2)
 	ssize_t len = 0;
-	unsigned char c;
+	unsigned char c = 0;
 #endif
 	char *sb = p;
 	int n = 0;
