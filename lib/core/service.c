@@ -1077,11 +1077,13 @@ lws_service_fd(struct lws_context *context, struct lws_pollfd *pollfd)
 LWS_VISIBLE int
 lws_service(struct lws_context *context, int timeout_ms)
 {
-	struct lws_context_per_thread *pt = &context->pt[0];
+	struct lws_context_per_thread *pt;
 	int n;
 
 	if (!context)
 		return 1;
+
+	pt = &context->pt[0];
 
 	pt->inside_service = 1;
 
