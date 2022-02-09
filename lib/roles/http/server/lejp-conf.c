@@ -71,7 +71,6 @@ enum lejp_global_paths {
 
 static const char * const paths_vhosts[] = {
 	"vhosts[]",
-	"vhosts[].mounts[]",
 	"vhosts[].name",
 	"vhosts[].port",
 	"vhosts[].interface",
@@ -96,7 +95,10 @@ static const char * const paths_vhosts[] = {
 	"vhosts[].mounts[].basic-auth",
 	"vhosts[].mounts[].cache-intermediaries",
 	"vhosts[].mounts[].extra-mimetypes.*",
+	"vhosts[].mounts[].extra-mimetypes",
 	"vhosts[].mounts[].interpret.*",
+	"vhosts[].mounts[].interpret",
+	"vhosts[].mounts[]",
 	"vhosts[].ws-protocols[].*.*",
 	"vhosts[].ws-protocols[].*",
 	"vhosts[].ws-protocols[]",
@@ -141,7 +143,6 @@ static const char * const paths_vhosts[] = {
 
 enum lejp_vhost_paths {
 	LEJPVP,
-	LEJPVP_MOUNTS,
 	LEJPVP_NAME,
 	LEJPVP_PORT,
 	LEJPVP_INTERFACE,
@@ -166,7 +167,12 @@ enum lejp_vhost_paths {
 	LEJPVP_MOUNT_BASIC_AUTH,
 	LEJPVP_MOUNT_CACHE_INTERMEDIARIES,
 	LEJPVP_MOUNT_EXTRA_MIMETYPES,
+	LEJPVP_MOUNT_EXTRA_MIMETYPES_base,
 	LEJPVP_MOUNT_INTERPRET,
+	LEJPVP_MOUNT_INTERPRET_base,
+
+	LEJPVP_MOUNTS,
+
 	LEJPVP_PROTOCOL_NAME_OPT,
 	LEJPVP_PROTOCOL_NAME,
 	LEJPVP_PROTOCOL,
@@ -941,6 +947,8 @@ lwsws_get_config(void *user, const char *f, const char * const *paths,
 	unsigned char buf[128];
 	struct lejp_ctx ctx;
 	int n, m = 0, fd;
+
+	memset(&ctx, 0, sizeof(ctx));
 
 	fd = lws_open(f, O_RDONLY);
 	if (fd < 0) {
